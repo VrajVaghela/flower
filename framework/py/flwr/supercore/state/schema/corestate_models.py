@@ -26,6 +26,7 @@ from sqlalchemy import (
     Double,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -216,13 +217,19 @@ class Message(FlwrBase):
 
 
 class Agent(FlwrBase):
-    """Represent a persistent agent owned by a Flower account.
-
-    ``app_spec`` identifies the AgentApp and an optional version.
-    """
+    """Represent an agent with a fixed AgentApp and current configuration version."""
 
     __tablename__ = "agent"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["agent_id", "config_version"],
+            ["agent_config.agent_id", "agent_config.version"],
+            name="fk_agent_config_version",
+            use_alter=True,
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        CheckConstraint("config_version > 0", name="ck_agent_config_version"),
         Index("idx_agent_flwr_aid", "flwr_aid"),
         {"sqlite_autoincrement": True},
     )
@@ -233,13 +240,39 @@ class Agent(FlwrBase):
         autoincrement=True,
         nullable=False,
     )
+    flwr_aid: Mapped[str] = mapped_column(String, nullable=False)
+    app_spec: Mapped[str] = mapped_column(String, nullable=False)
+    config_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Each agent has an immutable default Space shared exclusively with its creator.
+    default_space_id: Mapped[UUID] = mapped_column(
+        Uuid, ForeignKey("space.id", name="fk_agent_default_space_id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+
+
+class AgentConfig(FlwrBase):
+    """Represent an immutable snapshot of an agent's editable metadata."""
+
+    __tablename__ = "agent_config"
+    __table_args__ = (
+        CheckConstraint("version > 0", name="ck_agent_config_version_number"),
+    )
+
+    agent_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("agent.agent_id"), primary_key=True
+    )
+    version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     title: Mapped[str | None] = mapped_column(String, nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    app_spec: Mapped[str] = mapped_column(String, nullable=False)
-    flwr_aid: Mapped[str] = mapped_column(String, nullable=False)
+    avatar: Mapped[str] = mapped_column(
+        String, nullable=False, server_default=text("''")
+    )
+    color: Mapped[str] = mapped_column(
+        String, nullable=False, server_default=text("''")
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
 
 
 class RunSeries(FlwrBase):
@@ -309,6 +342,9 @@ class SpaceMessage(FlwrBase):
     )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    hidden: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
 
 
 class SeriesContext(FlwrBase):
@@ -378,9 +414,14 @@ class Automation(FlwrBase):
     automation_id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True, nullable=False
     )
-    federation_id: Mapped[str] = mapped_column(String, nullable=False)
+    federation_id: Mapped[str | None] = mapped_column(String, nullable=True)
     flwr_aid: Mapped[str] = mapped_column(String, nullable=False)
-    series_id: Mapped[int] = mapped_column(UInt64(), nullable=False)
+    agent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("agent.agent_id", name="fk_automation_agent_id"),
+        nullable=True,
+    )
+    series_id: Mapped[int | None] = mapped_column(UInt64(), nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
     start_run_request: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
@@ -422,15 +463,28 @@ class FederationApp(FlwrBase):
 
 
 class Connector(FlwrBase):
-    """Represent connector configuration for a federation."""
+    """Represent connector configuration owned by a federation or an agent."""
 
     __tablename__ = "connector"
-    __table_args__ = ({"sqlite_autoincrement": True},)
+    __table_args__ = (
+        CheckConstraint(
+            "(federation_id IS NOT NULL AND agent_id IS NULL) OR "
+            "(federation_id IS NULL AND agent_id IS NOT NULL)",
+            name="ck_connector_owner",
+        ),
+        Index("idx_connector_agent_id", "agent_id"),
+        {"sqlite_autoincrement": True},
+    )
 
     connector_id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True, nullable=False
     )
-    federation_id: Mapped[str] = mapped_column(String, nullable=False)
+    federation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("agent.agent_id", name="fk_connector_agent_id"),
+        nullable=True,
+    )
     connector_ref: Mapped[str] = mapped_column(String, nullable=False)
     credentials_json: Mapped[str] = mapped_column(String, nullable=False)
     config_json: Mapped[str] = mapped_column(String, nullable=False)
@@ -444,12 +498,25 @@ class ConnectorOAuthSession(FlwrBase):
     """Represent an OAuth authorization session for a connector."""
 
     __tablename__ = "connector_oauth_session"
+    __table_args__ = (
+        CheckConstraint(
+            "(federation_id IS NOT NULL AND agent_id IS NULL) OR "
+            "(federation_id IS NULL AND agent_id IS NOT NULL)",
+            name="ck_connector_oauth_session_owner",
+        ),
+        Index("idx_connector_oauth_session_agent_id", "agent_id"),
+    )
 
     oauth_session_id: Mapped[str] = mapped_column(
         String, primary_key=True, nullable=False
     )
     flwr_aid: Mapped[str] = mapped_column(String, nullable=False)
-    federation_id: Mapped[str] = mapped_column(String, nullable=False)
+    federation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("agent.agent_id", name="fk_connector_oauth_session_agent_id"),
+        nullable=True,
+    )
     connector_ref: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
     redirect_uri: Mapped[str] = mapped_column(String, nullable=False)

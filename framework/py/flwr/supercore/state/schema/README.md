@@ -11,25 +11,36 @@
 ---
 erDiagram
   agent {
-    BIGINT agent_id PK
+    BIGINT agent_id PK,FK
+    BIGINT config_version FK
+    CHAR(32) default_space_id FK
     VARCHAR app_spec
     TIMESTAMP created_at
-    TEXT description "nullable"
     VARCHAR flwr_aid
+    TIMESTAMP updated_at
+  }
+
+  agent_config {
+    BIGINT agent_id PK,FK
+    BIGINT version PK
+    VARCHAR avatar
+    VARCHAR color
+    TIMESTAMP created_at
+    TEXT description "nullable"
     VARCHAR name
     VARCHAR title "nullable"
-    TIMESTAMP updated_at
   }
 
   automation {
     INTEGER automation_id PK
+    BIGINT agent_id FK "nullable"
     TIMESTAMP created_at
-    VARCHAR federation_id
+    VARCHAR federation_id "nullable"
     BIGINT fixed_interval "nullable"
     VARCHAR flwr_aid
     TIMESTAMP next_run_at
     INTEGER remaining_runs "nullable"
-    BIGINT series_id
+    BIGINT series_id "nullable"
     BLOB start_run_request "nullable"
     VARCHAR status
     TIMESTAMP stopped_at "nullable"
@@ -47,6 +58,7 @@ erDiagram
 
   connector {
     INTEGER connector_id PK
+    BIGINT agent_id FK "nullable"
     VARCHAR config_json
     VARCHAR connector_ref
     TIMESTAMP created_at
@@ -54,16 +66,17 @@ erDiagram
     VARCHAR credentials_json
     TIMESTAMP deleted_at "nullable"
     VARCHAR deleted_by "nullable"
-    VARCHAR federation_id
+    VARCHAR federation_id "nullable"
   }
 
   connector_oauth_session {
     VARCHAR oauth_session_id PK
+    BIGINT agent_id FK "nullable"
     TIMESTAMP completed_at "nullable"
     VARCHAR connector_ref
     TIMESTAMP created_at
     TIMESTAMP expires_at
-    VARCHAR federation_id
+    VARCHAR federation_id "nullable"
     VARCHAR flwr_aid
     VARCHAR pkce_verifier "nullable"
     VARCHAR redirect_uri
@@ -204,6 +217,7 @@ erDiagram
     BIGINT primary_task_id
     BIGINT run_id UK "nullable"
     BIGINT series_id "nullable"
+    VARCHAR trigger_item_type "nullable"
     VARCHAR usage_reported_at
   }
 
@@ -250,6 +264,7 @@ erDiagram
     TEXT content
     TIMESTAMP created_at
     VARCHAR flwr_aid "nullable"
+    BOOLEAN hidden
   }
 
   space_participant {
@@ -329,7 +344,14 @@ erDiagram
     CHAR(32) event_id FK
   }
 
+  agent_config ||--o| agent : agent_id
+  agent_config ||--o{ agent : config_version
+  space ||--o{ agent : default_space_id
+  agent ||--o| agent_config : agent_id
+  agent ||--o{ automation : agent_id
   agent ||--o{ compacted_contexts : agent_id
+  agent ||--o{ connector : agent_id
+  agent ||--o{ connector_oauth_session : agent_id
   space ||--o{ events : space_id
   message ||--o{ message : reply_to_message_id
   objects ||--o| object_children : parent_id

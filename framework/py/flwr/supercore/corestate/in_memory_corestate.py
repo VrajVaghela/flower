@@ -40,6 +40,7 @@ from flwr.common.constant import (
     Status,
     SubStatus,
 )
+from flwr.common.serde import run_to_proto
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
     Agent,
     AgentConfig,
@@ -52,6 +53,7 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
 )
 from flwr.proto.file_pb2 import File, FileMetadata  # pylint: disable=E0611
 from flwr.proto.message_pb2 import ObjectTree  # pylint: disable=E0611
+from flwr.proto.run_pb2 import Run as ProtoRun  # pylint: disable=E0611
 from flwr.proto.runseries_pb2 import (  # pylint: disable=E0611
     CompactedContext,
     RunSeries,
@@ -608,33 +610,59 @@ class InMemoryCoreState(
             return None
         with self.lock_space_store, self.lock_agent_store:
             created_at = now().isoformat()
-            agent = Agent(
-                id=self.agent_id_counter + 1,
-                config=config,
-                created_at=created_at,
-                updated_at=created_at,
-            )
-            event_id = self.store_event(EventType.AGENT_CREATED, agent, [flwr_aid])
-            self.agent_store.setdefault(flwr_aid, {})[agent.id] = agent
+            space_id = uuid4()
+            if space_id in self.space_store:
+                raise ValueError("Space ID already exists")
+            agent_id = self.agent_id_counter + 1
+            feed = self.user_event_store.setdefault(flwr_aid, [])
+            feed_start = len(feed)
             try:
-                self.create_space(
-                    participants=[
+                # Create the Space first so the agent can record it as its default.
+                space = Space(id=str(space_id), created_at=created_at)
+                self.space_store[space_id] = space
+                self.space_message_store[space_id] = []
+                agent = Agent(
+                    id=agent_id,
+                    config=config,
+                    created_at=created_at,
+                    updated_at=created_at,
+                    default_space_id=str(space_id),
+                )
+                self.agent_store.setdefault(flwr_aid, {})[agent_id] = agent
+                space.participants.extend(
+                    [
                         SpaceParticipant(flwr_aid=flwr_aid),
-                        SpaceParticipant(agent_id=agent.id),
+                        SpaceParticipant(agent_id=agent_id),
                     ]
                 )
+                # Emit events after membership is complete, preserving their order.
+                self.store_event(EventType.AGENT_CREATED, agent, [flwr_aid])
+                self.store_event(
+                    EventType.SPACE_CREATED, space, [flwr_aid], space_id=space_id
+                )
             except Exception:
-                del self.agent_store[flwr_aid][agent.id]
-                self.user_event_store[flwr_aid].remove(event_id)
-                del self.event_store[event_id]
+                for event_id in feed[feed_start:]:
+                    del self.event_store[event_id]
+                del feed[feed_start:]
+                self.agent_store.get(flwr_aid, {}).pop(agent_id, None)
+                self.space_store.pop(space_id, None)
+                self.space_message_store.pop(space_id, None)
                 raise
-            self.agent_id_counter = agent.id
+            self.agent_id_counter = agent_id
             return agent
 
     def get_agent(self, flwr_aid: str, agent_id: int) -> Agent | None:
         """Return an agent owned by the account."""
         with self.lock_agent_store:
             return self.agent_store.get(flwr_aid, {}).get(agent_id)
+
+    def get_default_space(self, flwr_aid: str, agent_id: int) -> UUID | None:
+        """Return the owned agent's default Space ID."""
+        with self.lock_agent_store:
+            agent = self.agent_store.get(flwr_aid, {}).get(agent_id)
+            if agent is None or not agent.default_space_id:
+                return None
+            return UUID(agent.default_space_id)
 
     def list_agents(self, flwr_aid: str) -> Sequence[Agent]:
         """List an account's agents in ascending agent ID order."""
@@ -650,17 +678,27 @@ class InMemoryCoreState(
         """Read the feed cursor before fetching visible state."""
         with self.lock_space_store:
             head = len(self.user_event_store.get(flwr_aid, []))
+        agents = self.list_agents(flwr_aid)
+        spaces = self.get_spaces(flwr_aid)
         return BootstrapResponse(
-            agents=self.list_agents(flwr_aid),
-            spaces=self.get_spaces(flwr_aid),
+            agents=agents,
+            spaces=spaces,
+            active_runs=[
+                run_to_proto(run)
+                for run in self.get_run(
+                    space_ids=[UUID(space.id) for space in spaces],
+                    statuses=[Status.PENDING, Status.STARTING, Status.RUNNING],
+                )
+                if run.agent_id is not None
+            ],
             cursor=head,
         )
 
     def store_event(
         self,
         event_type: str,
-        payload: Agent | Space | SpaceMessage,
-        recipients: Sequence[str],
+        payload: Agent | Space | SpaceMessage | ProtoRun | Task,
+        recipients: Sequence[str] | None = None,
         space_id: UUID | None = None,
     ) -> UUID:
         """Create an event and its deliveries, returning its UUID."""
@@ -675,6 +713,14 @@ class InMemoryCoreState(
         with self.lock_space_store:
             if space_id is not None and space_id not in self.space_store:
                 raise ValueError("Event Space does not exist")
+            if recipients is None:
+                if space_id is None:
+                    raise ValueError("Provide recipients or a space_id")
+                recipients = [
+                    p.flwr_aid
+                    for p in self.space_store[space_id].participants
+                    if p.flwr_aid
+                ]
             self.event_store[event_id] = event
             for user_id in sorted(set(recipients)):
                 self.user_event_store.setdefault(user_id, []).append(event_id)
@@ -893,14 +939,23 @@ class InMemoryCoreState(
 
     def create_connector(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
-        federation_id: str,
+        federation_id: str | None,
         connector_ref: str,
         credentials_json: str,
         config_json: str,
         created_by: str,
+        agent_id: int | None = None,
     ) -> int | None:
-        """Create a connector for a federation."""
-        if not federation_id or not connector_ref or not created_by:
+        """Create a connector owned by a federation or an existing agent."""
+        if not connector_ref or not created_by:
+            return None
+        if (
+            (federation_id is None) == (agent_id is None)
+            or federation_id == ""
+            or (agent_id is not None and agent_id <= 0)
+        ):
+            return None
+        if agent_id is not None and self.get_agent(created_by, agent_id) is None:
             return None
         with self.lock_connector_store:
             self.connector_id_counter += 1
@@ -908,6 +963,7 @@ class InMemoryCoreState(
             connector = ConnectorRecord(
                 connector_id=connector_id,
                 federation_id=federation_id,
+                agent_id=agent_id,
                 connector_ref=connector_ref,
                 credentials_json=credentials_json,
                 config_json=config_json,
@@ -937,6 +993,20 @@ class InMemoryCoreState(
         with self.lock_connector_store:
             return self.connector_store.get(connector_id)
 
+    def get_agent_connectors(self, agent_id: int) -> Sequence[ConnectorRecord]:
+        """List an agent's connectors in ascending connector ID order."""
+        if agent_id <= 0:
+            return []
+        with self.lock_connector_store:
+            return sorted(
+                (
+                    connector
+                    for connector in self.connector_store.values()
+                    if connector.agent_id == agent_id
+                ),
+                key=lambda connector: connector.connector_id,
+            )
+
     def update_connector_credentials(
         self,
         connector_id: int,
@@ -956,13 +1026,27 @@ class InMemoryCoreState(
             )
             return credentials_json
 
-    def delete_connector(self, federation_id: str, connector_id: int) -> bool:
-        """Delete a federation's connector if it exists."""
-        if not federation_id or connector_id <= 0:
+    def delete_connector(
+        self,
+        federation_id: str | None,
+        connector_id: int,
+        agent_id: int | None = None,
+    ) -> bool:
+        """Delete a connector belonging to the specified federation or agent."""
+        if (
+            (federation_id is None) == (agent_id is None)
+            or federation_id == ""
+            or (agent_id is not None and agent_id <= 0)
+            or connector_id <= 0
+        ):
             return False
         with self.lock_connector_store:
             connector = self.connector_store.get(connector_id)
-            if connector is None or connector.federation_id != federation_id:
+            if (
+                connector is None
+                or connector.federation_id != federation_id
+                or connector.agent_id != agent_id
+            ):
                 return False
             del self.connector_store[connector_id]
             return True
@@ -984,27 +1068,36 @@ class InMemoryCoreState(
         self,
         oauth_session_id: str,
         flwr_aid: str,
-        federation_id: str,
+        federation_id: str | None,
         connector_ref: str,
         state: str,
         redirect_uri: str,
         pkce_verifier: str | None,
         expires_at: datetime,
+        agent_id: int | None = None,
     ) -> ConnectorOAuthSessionRecord | None:
         """Create and return a connector OAuth session."""
         if (
             not oauth_session_id
             or not flwr_aid
-            or not federation_id
             or not connector_ref
             or expires_at.utcoffset() is None
         ):
+            return None
+        if (
+            (federation_id is None) == (agent_id is None)
+            or federation_id == ""
+            or (agent_id is not None and agent_id <= 0)
+        ):
+            return None
+        if agent_id is not None and self.get_agent(flwr_aid, agent_id) is None:
             return None
         expires_at = expires_at.astimezone(UTC)
         session = ConnectorOAuthSessionRecord(
             oauth_session_id=oauth_session_id,
             flwr_aid=flwr_aid,
             federation_id=federation_id,
+            agent_id=agent_id,
             connector_ref=connector_ref,
             state=state,
             redirect_uri=redirect_uri,
@@ -1097,14 +1190,24 @@ class InMemoryCoreState(
             return space
 
     def get_spaces(self, flwr_aid: str) -> Sequence[Space]:
-        """Return participating spaces, newest first."""
+        """Return participating spaces with their latest user message, newest first."""
         viewer = SpaceParticipant(flwr_aid=flwr_aid)
         with self.lock_space_store:
-            spaces = [
-                space
-                for space in self.space_store.values()
-                if viewer in space.participants
-            ]
+            spaces = []
+            for space_id, space in self.space_store.items():
+                if viewer not in space.participants:
+                    continue
+                result = Space()
+                result.CopyFrom(space)
+                result.latest_user_message = next(
+                    (
+                        message.content
+                        for message in reversed(self.space_message_store[space_id])
+                        if message.author.HasField("flwr_aid")
+                    ),
+                    "",
+                )
+                spaces.append(result)
             spaces.sort(key=lambda item: item.created_at, reverse=True)
             return spaces
 
@@ -1125,12 +1228,7 @@ class InMemoryCoreState(
                 created_at=now().isoformat(),
                 content=content,
             )
-            self.store_event(
-                EventType.MESSAGE_CREATED,
-                message,
-                [p.flwr_aid for p in space.participants if p.flwr_aid],
-                space_id=space_id,
-            )
+            self.store_event(EventType.MESSAGE_CREATED, message, space_id=space_id)
             self.space_message_id_counter = message.id
             self.space_message_store[space_id].append(message)
             return message
@@ -1337,15 +1435,26 @@ class InMemoryCoreState(
     def store_automation(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         *,
-        federation_id: str,
+        federation_id: str | None = None,
         flwr_aid: str,
         start_run_request: StartRunRequest,
-        series_id: int,
+        series_id: int | None = None,
         next_run_at: str,
         fixed_interval: int | None = None,
         max_runs: int | None = None,
+        agent_id: int | None = None,
     ) -> Automation:
         """Store an automation and return its metadata."""
+        if not (
+            (agent_id is not None and federation_id is None and series_id is None)
+            or (
+                agent_id is None and federation_id is not None and series_id is not None
+            )
+        ):
+            raise ValueError("Provide agent_id or both federation_id and series_id.")
+        if agent_id is not None and self.get_agent(flwr_aid, agent_id) is None:
+            raise ValueError("Agent not found.")
+
         with self.lock_automation_store:
             current = now()
             automation_id = self._next_automation_id
@@ -1353,14 +1462,15 @@ class InMemoryCoreState(
             automation = Automation(
                 automation_id=automation_id,
                 status=AutomationStatus.ACTIVE,
-                federation=federation_id,
-                series_id=series_id,
+                federation=federation_id or "",
+                series_id=series_id or 0,
                 flwr_aid=flwr_aid,
                 created_at=current.isoformat(),
                 updated_at=current.isoformat(),
                 next_run_at=next_run_at,
                 fixed_interval=fixed_interval,
                 remaining_runs=max_runs,
+                agent_id=agent_id,
             )
 
             stored_request = StartRunRequest()
@@ -1602,6 +1712,7 @@ class InMemoryCoreState(
             )
 
             self.task_store[task_id] = task
+            self._store_task_lifecycle_event(EventType.TASK_CREATED, task)
             return task_id
 
     def get_tasks(  # pylint: disable=too-many-arguments
@@ -1737,6 +1848,7 @@ class InMemoryCoreState(
                 active_until=claimed_at + timedelta(seconds=HEARTBEAT_DEFAULT_INTERVAL),
             )
             self.task_token_to_task_id[token] = task_id
+            self._store_task_lifecycle_event(EventType.TASK_UPDATED, task)
             return token
 
     def activate_task(self, task_id: int) -> bool:
@@ -1760,6 +1872,7 @@ class InMemoryCoreState(
                 record.active_until = activated_at + timedelta(
                     seconds=HEARTBEAT_PATIENCE * HEARTBEAT_DEFAULT_INTERVAL
                 )
+            self._store_task_lifecycle_event(EventType.TASK_UPDATED, task)
             return True
 
     def finish_task(self, task_id: int, sub_status: str, details: str) -> bool:
@@ -1793,6 +1906,7 @@ class InMemoryCoreState(
             # Revoke any existing task token now that the task is finished.
             if (record := self.task_token_store.pop(task_id, None)) is not None:
                 self.task_token_to_task_id.pop(record.token, None)
+            self._store_task_lifecycle_event(EventType.TASK_UPDATED, task)
             return True
 
     def acknowledge_task_heartbeat(self, task_id: int) -> bool:
@@ -2007,6 +2121,7 @@ class InMemoryCoreState(
         """
         current = now()
         expired_tasks: list[Task] = []
+        pending_tasks: list[Task] = []
         for task_id, record in list(self.task_token_store.items()):
             if record.active_until < current:
                 task = self.task_store.get(task_id)
@@ -2015,6 +2130,7 @@ class InMemoryCoreState(
                     task.status.CopyFrom(
                         TaskStatus(status=Status.PENDING, sub_status="", details="")
                     )
+                    pending_tasks.append(task)
                 elif task and task.status.status == Status.RUNNING:
                     task.finished_at = record.active_until.isoformat()
                     task.status.CopyFrom(
@@ -2030,6 +2146,8 @@ class InMemoryCoreState(
                 del self.task_token_store[task_id]
                 self.task_token_to_task_id.pop(record.token, None)
 
+        for task in pending_tasks + expired_tasks:
+            self._store_task_lifecycle_event(EventType.TASK_UPDATED, task)
         if expired_tasks:
             self._on_task_tokens_expired(expired_tasks)
 
